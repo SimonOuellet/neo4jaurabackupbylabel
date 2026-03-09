@@ -148,7 +148,22 @@ def _serialize(val):
         return [_serialize(v) for v in val]
     if isinstance(val, bytes):
         return {"__neo4j__": "bytes", "v": base64.b64encode(val).decode()}
-    # Temporal / spatial types → tagged string
+    # Spatial types → tagged coordinate list for lossless round-trip
+    try:
+        import neo4j.spatial as ns
+        if isinstance(val, ns.WGS84Point):
+            coords = [val.longitude, val.latitude]
+            if hasattr(val, "height"):
+                coords.append(val.height)
+            return {"__neo4j__": "WGS84Point", "v": coords}
+        if isinstance(val, ns.CartesianPoint):
+            coords = [val.x, val.y]
+            if hasattr(val, "z"):
+                coords.append(val.z)
+            return {"__neo4j__": "CartesianPoint", "v": coords}
+    except ImportError:
+        pass
+    # Temporal types → tagged ISO string
     return {"__neo4j__": type(val).__name__, "v": str(val)}
 
 
@@ -163,6 +178,16 @@ def _deserialize(val):
             t, v = val["__neo4j__"], val["v"]
             if t == "bytes":
                 return base64.b64decode(v)
+            # Spatial types
+            try:
+                import neo4j.spatial as ns
+                if t == "WGS84Point":
+                    return ns.WGS84Point(v)
+                if t == "CartesianPoint":
+                    return ns.CartesianPoint(v)
+            except (ImportError, TypeError, ValueError):
+                pass
+            # Temporal types
             try:
                 import neo4j.time as nt
                 cls = getattr(nt, t, None)
