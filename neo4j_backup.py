@@ -453,6 +453,8 @@ def do_import(args):
     # Support old format ("label": str), "labels" (AND list), "labels_or" (OR list)
     labels_and = meta.get("labels") or ([meta["label"]] if "label" in meta else [])
     labels_or = meta.get("labels_or", [])
+    require_labels = meta.get("require_labels", [])
+    exclude_labels = meta.get("exclude_labels", [])
     nodes = data["nodes"]
     rels = data["relationships"]
     constraints_data = data.get("constraints", [])
@@ -475,6 +477,9 @@ def do_import(args):
             if args.clear:
                 clear_clause, clear_where, clear_display = _build_label_clause(
                     labels_and, labels_or)
+                clear_where = list(clear_where)
+                clear_where += [f"n:{_esc(r)}" for r in require_labels]
+                clear_where += [f"NOT n:{_esc(e)}" for e in exclude_labels]
                 clear_match_expr = f"(n:{clear_clause})" if clear_clause else "(n)"
                 clear_where_str = (
                     "WHERE " + " AND ".join(clear_where)) if clear_where else ""
