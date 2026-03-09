@@ -382,15 +382,25 @@ def do_export(args):
             # ── 4. Internal relationships ────────────────────────────
             print("Exporting internal relationships …")
             rels = []
-            eid_set = set(eid_to_idx.keys())
-            # Use the exported elementIds to find internal rels
+            # Build the relationship query using the same label filters as the
+            # node export instead of passing potentially large $eids lists.
+            a_match_expr = f"(a:{match_clause})" if match_clause else "(a)"
+            b_match_expr = f"(b:{match_clause})" if match_clause else "(b)"
+            rel_where_parts = []
+            if labels_or:
+                a_or = " OR ".join(f"a:{_esc(l)}" for l in labels_or)
+                b_or = " OR ".join(f"b:{_esc(l)}" for l in labels_or)
+                rel_where_parts.append(f"({a_or})")
+                rel_where_parts.append(f"({b_or})")
+            rel_where_parts += [f"a:{_esc(r)}" for r in require]
+            rel_where_parts += [f"b:{_esc(r)}" for r in require]
+            rel_where_parts += [f"NOT a:{_esc(e)}" for e in exclude]
+            rel_where_parts += [f"NOT b:{_esc(e)}" for e in exclude]
+            rel_where = ("WHERE " + " AND ".join(rel_where_parts)) if rel_where_parts else ""
             for rec in session.run(
-                "UNWIND $eids AS eid "
-                "MATCH (a)-[r]->(b) "
-                "WHERE elementId(a) = eid "
+                f"MATCH {a_match_expr}-[r]->{b_match_expr} {rel_where} "
                 "RETURN elementId(a) AS a_eid, elementId(b) AS b_eid, "
-                "       type(r) AS rtype, properties(r) AS rprops",
-                {"eids": list(eid_set)},
+                "       type(r) AS rtype, properties(r) AS rprops"
             ):
                 a_idx = eid_to_idx.get(rec["a_eid"])
                 b_idx = eid_to_idx.get(rec["b_eid"])
