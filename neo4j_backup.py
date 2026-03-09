@@ -23,6 +23,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import time
 from collections import defaultdict
 from datetime import datetime
@@ -270,6 +271,25 @@ def _merge_keys_for(node_labels, merge_map):
     return None
 
 
+def _stream_ndjson_array(path, out_file):
+    """Write lines from an NDJSON file as JSON array elements into out_file.
+
+    Each non-empty line is copied verbatim (already valid JSON) separated by
+    commas, so the caller only needs to open/close the surrounding ``[`` and
+    ``]`` brackets.
+    """
+    first = True
+    with open(path, "r", encoding="utf-8") as src:
+        for line in src:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            if not first:
+                out_file.write(",")
+            out_file.write(line)
+            first = False
+
+
 # ── Export ───────────────────────────────────────────────────────────────
 
 def _build_label_clause(labels_and, labels_or):
@@ -323,9 +343,10 @@ def do_export(args):
 
     driver = _connect(uri, user, pwd, db)
     match_clause, label_where, display = _build_label_clause(labels_and, labels_or)
+    nodes_tmp_path = None
+    rels_tmp_path = None
     try:
         with RetrySession(driver, db) as session:
-            # ── 1. Export nodes ──────────────────────────────────────
             where_parts = list(label_where)
             where_parts += [f"n:{_esc(r)}" for r in require]
             where_parts += [f"NOT n:{_esc(e)}" for e in exclude]
@@ -337,25 +358,16 @@ def do_export(args):
                   + (f" (require: {require})" if require else "")
                   + (f" (exclude: {exclude})" if exclude else ""))
 
-            records = list(session.run(
-                f"MATCH {match_expr} {where} "
-                f"RETURN elementId(n) AS eid, labels(n) AS labels, properties(n) AS props"
-            ))
-
-            nodes = []
-            eid_to_idx = {}
+            # ── 1. Discover labels (lightweight query) ───────────────
+            # Collect all_labels separately so schema can be discovered
+            # before streaming node data.
             all_labels = set()
+            for rec in session.run(
+                f"MATCH {match_expr} {where} RETURN DISTINCT labels(n) AS lbls"
+            ):
+                all_labels.update(rec["lbls"])
 
-            for rec in records:
-                eid = rec["eid"]
-                lbls = sorted(rec["labels"])
-                props = {k: _serialize(v) for k, v in rec["props"].items()}
-                eid_to_idx[eid] = len(nodes)
-                all_labels.update(lbls)
-                nodes.append({"labels": lbls, "properties": props})
-
-            print(f"  {len(nodes)} nodes ({len(all_labels)} labels: {sorted(all_labels)})")
-            if not nodes:
+            if not all_labels:
                 print("Nothing to export.")
                 return
 
@@ -363,80 +375,134 @@ def do_export(args):
             print("Discovering schema …")
             constraints, indexes = _discover_schema(session, all_labels)
             print(f"  {len(constraints)} constraints, {len(indexes)} indexes")
-
-            # ── 3. Merge keys ────────────────────────────────────────
             merge_map = _build_merge_map(constraints)
-            no_key_count = 0
-            for n in nodes:
-                mk = _merge_keys_for(n["labels"], merge_map)
-                if mk:
-                    n["merge_keys"] = mk
-                else:
-                    no_key_count += 1
-                    n["merge_keys"] = list(n["properties"].keys())
 
+            # ── 3. Stream nodes → temp file ──────────────────────────
+            # Only eid_to_idx (eid→index mapping) is kept in memory;
+            # node dicts are written to disk immediately and never
+            # accumulated as a list.
+            print("Exporting nodes …")
+            eid_to_idx = {}
+            label_counts = defaultdict(int)
+            node_count = 0
+            no_key_count = 0
+
+            nodes_tmp = tempfile.NamedTemporaryFile(
+                mode="w", suffix=".ndjson", delete=False, encoding="utf-8"
+            )
+            nodes_tmp_path = nodes_tmp.name
+            try:
+                for rec in session.run(
+                    f"MATCH {match_expr} {where} "
+                    f"RETURN elementId(n) AS eid, labels(n) AS labels, "
+                    f"properties(n) AS props"
+                ):
+                    eid = rec["eid"]
+                    lbls = sorted(rec["labels"])
+                    props = {k: _serialize(v) for k, v in rec["props"].items()}
+                    eid_to_idx[eid] = node_count
+                    node_count += 1
+                    for lbl in lbls:
+                        label_counts[lbl] += 1
+                    mk = _merge_keys_for(lbls, merge_map)
+                    if mk:
+                        merge_keys = mk
+                    else:
+                        no_key_count += 1
+                        merge_keys = list(props.keys())
+                    node = {"labels": lbls, "properties": props,
+                            "merge_keys": merge_keys}
+                    json.dump(node, nodes_tmp, ensure_ascii=False)
+                    nodes_tmp.write("\n")
+            finally:
+                nodes_tmp.close()
+
+            if node_count == 0:
+                print("Nothing to export.")
+                return
+
+            print(f"  {node_count} nodes "
+                  f"({len(all_labels)} labels: {sorted(all_labels)})")
             if no_key_count:
                 print(f"  Warning: {no_key_count} nodes lack uniqueness constraints "
                       f"→ all properties used as merge keys")
 
-            # ── 4. Internal relationships ────────────────────────────
+            # ── 4. Stream relationships → temp file ──────────────────
             print("Exporting internal relationships …")
-            rels = []
             eid_set = set(eid_to_idx.keys())
-            # Use the exported elementIds to find internal rels
-            for rec in session.run(
-                "UNWIND $eids AS eid "
-                "MATCH (a)-[r]->(b) "
-                "WHERE elementId(a) = eid "
-                "RETURN elementId(a) AS a_eid, elementId(b) AS b_eid, "
-                "       type(r) AS rtype, properties(r) AS rprops",
-                {"eids": list(eid_set)},
-            ):
-                a_idx = eid_to_idx.get(rec["a_eid"])
-                b_idx = eid_to_idx.get(rec["b_eid"])
-                if a_idx is not None and b_idx is not None:
-                    rprops = {k: _serialize(v) for k, v in rec["rprops"].items()}
-                    rels.append({
-                        "type": rec["rtype"],
-                        "start_node": a_idx,
-                        "end_node": b_idx,
-                        "properties": rprops,
-                    })
+            rel_count = 0
 
-            print(f"  {len(rels)} relationships")
+            rels_tmp = tempfile.NamedTemporaryFile(
+                mode="w", suffix=".ndjson", delete=False, encoding="utf-8"
+            )
+            rels_tmp_path = rels_tmp.name
+            try:
+                for rec in session.run(
+                    "UNWIND $eids AS eid "
+                    "MATCH (a)-[r]->(b) "
+                    "WHERE elementId(a) = eid "
+                    "RETURN elementId(a) AS a_eid, elementId(b) AS b_eid, "
+                    "       type(r) AS rtype, properties(r) AS rprops",
+                    {"eids": list(eid_set)},
+                ):
+                    a_idx = eid_to_idx.get(rec["a_eid"])
+                    b_idx = eid_to_idx.get(rec["b_eid"])
+                    if a_idx is not None and b_idx is not None:
+                        rprops = {k: _serialize(v)
+                                  for k, v in rec["rprops"].items()}
+                        rel = {
+                            "type": rec["rtype"],
+                            "start_node": a_idx,
+                            "end_node": b_idx,
+                            "properties": rprops,
+                        }
+                        json.dump(rel, rels_tmp, ensure_ascii=False)
+                        rels_tmp.write("\n")
+                        rel_count += 1
+            finally:
+                rels_tmp.close()
 
-            # ── 5. Write JSON ────────────────────────────────────────
-            data = {
-                "metadata": {
-                    "exported_at": datetime.utcnow().isoformat() + "Z",
-                    "labels": labels_and,
-                    "labels_or": labels_or,
-                    "require_labels": require,
-                    "exclude_labels": exclude,
-                    "source_uri": uri,
-                    "source_database": db,
-                    "node_count": len(nodes),
-                    "relationship_count": len(rels),
-                    "label_summary": {
-                        l: sum(1 for n in nodes if l in n["labels"])
-                        for l in sorted(all_labels)
-                    },
-                },
-                "constraints": constraints,
-                "indexes": indexes,
-                "nodes": nodes,
-                "relationships": rels,
+            print(f"  {rel_count} relationships")
+
+            # ── 5. Assemble final JSON from temp files ───────────────
+            # Metadata is written first (counts are now known), then
+            # nodes and relationships are streamed from disk line by
+            # line so the full dataset is never held in RAM.
+            metadata = {
+                "exported_at": datetime.utcnow().isoformat() + "Z",
+                "labels": labels_and,
+                "labels_or": labels_or,
+                "require_labels": require,
+                "exclude_labels": exclude,
+                "source_uri": uri,
+                "source_database": db,
+                "node_count": node_count,
+                "relationship_count": rel_count,
+                "label_summary": {l: label_counts[l] for l in sorted(all_labels)},
             }
 
             with open(output, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False)
+                f.write('{"metadata":')
+                json.dump(metadata, f, ensure_ascii=False)
+                f.write(',"constraints":')
+                json.dump(constraints, f, ensure_ascii=False)
+                f.write(',"indexes":')
+                json.dump(indexes, f, ensure_ascii=False)
+                f.write(',"nodes":[')
+                _stream_ndjson_array(nodes_tmp_path, f)
+                f.write('],"relationships":[')
+                _stream_ndjson_array(rels_tmp_path, f)
+                f.write("]}")
 
             size_mb = os.path.getsize(output) / (1024 * 1024)
             print(f"\nExported to {output} ({size_mb:.1f} MB)")
-            print(f"  {len(nodes)} nodes, {len(rels)} relationships, "
+            print(f"  {node_count} nodes, {rel_count} relationships, "
                   f"{len(constraints)} constraints, {len(indexes)} indexes")
     finally:
         driver.close()
+        for path in (nodes_tmp_path, rels_tmp_path):
+            if path and os.path.exists(path):
+                os.unlink(path)
 
 
 # ── Import ───────────────────────────────────────────────────────────────
