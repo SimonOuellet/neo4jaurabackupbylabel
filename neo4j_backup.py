@@ -28,9 +28,9 @@ from collections import defaultdict
 from datetime import datetime
 
 
-# ── .env loader ──────────────────────────────────────────────────────────
+# ── .env loader (same pattern as jira_etl.py) ───────────────────────────
 
-def load_env_file(filepath=".env", override=False):
+def load_env_file(filepath=".env"):
     if not os.path.exists(filepath):
         return
     with open(filepath, "r") as f:
@@ -40,10 +40,7 @@ def load_env_file(filepath=".env", override=False):
                 continue
             if "=" in line:
                 key, value = line.split("=", 1)
-                key = key.strip()
-                value = value.strip()
-                if override or key not in os.environ:
-                    os.environ[key] = value
+                os.environ[key.strip()] = value.strip()
 
 
 load_env_file()
@@ -171,15 +168,6 @@ def _deserialize(val):
                 cls = getattr(nt, t, None)
                 if cls and hasattr(cls, "from_iso_format"):
                     return cls.from_iso_format(v)
-            except Exception:
-                pass
-            try:
-                import neo4j.spatial as ns
-                if t in ("CartesianPoint", "WGS84Point"):
-                    m = re.match(r"^\w+\((.*)\)$", v)
-                    if m:
-                        coords = [float(x.strip()) for x in m.group(1).split(",")]
-                        return getattr(ns, t)(coords)
             except Exception:
                 pass
             return v  # fallback → string
@@ -349,10 +337,10 @@ def do_export(args):
                   + (f" (require: {require})" if require else "")
                   + (f" (exclude: {exclude})" if exclude else ""))
 
-            records = session.run(
+            records = list(session.run(
                 f"MATCH {match_expr} {where} "
                 f"RETURN elementId(n) AS eid, labels(n) AS labels, properties(n) AS props"
-            )
+            ))
 
             nodes = []
             eid_to_idx = {}
@@ -394,29 +382,26 @@ def do_export(args):
             # ── 4. Internal relationships ────────────────────────────
             print("Exporting internal relationships …")
             rels = []
-            eid_list = list(eid_to_idx.keys())
-            # Use the exported elementIds to find internal rels (batching to avoid parameter limits)
-            rel_batch_size = 10000
-            for i in range(0, len(eid_list), rel_batch_size):
-                batch_eids = eid_list[i:i + rel_batch_size]
-                for rec in session.run(
-                    "UNWIND $eids AS eid "
-                    "MATCH (a)-[r]->(b) "
-                    "WHERE elementId(a) = eid "
-                    "RETURN elementId(a) AS a_eid, elementId(b) AS b_eid, "
-                    "       type(r) AS rtype, properties(r) AS rprops",
-                    {"eids": batch_eids},
-                ):
-                    a_idx = eid_to_idx.get(rec["a_eid"])
-                    b_idx = eid_to_idx.get(rec["b_eid"])
-                    if a_idx is not None and b_idx is not None:
-                        rprops = {k: _serialize(v) for k, v in rec["rprops"].items()}
-                        rels.append({
-                            "type": rec["rtype"],
-                            "start_node": a_idx,
-                            "end_node": b_idx,
-                            "properties": rprops,
-                        })
+            eid_set = set(eid_to_idx.keys())
+            # Use the exported elementIds to find internal rels
+            for rec in session.run(
+                "UNWIND $eids AS eid "
+                "MATCH (a)-[r]->(b) "
+                "WHERE elementId(a) = eid "
+                "RETURN elementId(a) AS a_eid, elementId(b) AS b_eid, "
+                "       type(r) AS rtype, properties(r) AS rprops",
+                {"eids": list(eid_set)},
+            ):
+                a_idx = eid_to_idx.get(rec["a_eid"])
+                b_idx = eid_to_idx.get(rec["b_eid"])
+                if a_idx is not None and b_idx is not None:
+                    rprops = {k: _serialize(v) for k, v in rec["rprops"].items()}
+                    rels.append({
+                        "type": rec["rtype"],
+                        "start_node": a_idx,
+                        "end_node": b_idx,
+                        "properties": rprops,
+                    })
 
             print(f"  {len(rels)} relationships")
 
@@ -468,8 +453,6 @@ def do_import(args):
     # Support old format ("label": str), "labels" (AND list), "labels_or" (OR list)
     labels_and = meta.get("labels") or ([meta["label"]] if "label" in meta else [])
     labels_or = meta.get("labels_or", [])
-    require = meta.get("require_labels", [])
-    exclude = meta.get("exclude_labels", [])
     nodes = data["nodes"]
     rels = data["relationships"]
     constraints_data = data.get("constraints", [])
@@ -490,20 +473,23 @@ def do_import(args):
         with RetrySession(driver, db) as session:
             # ── Clear ────────────────────────────────────────────────
             if args.clear:
+                require = meta.get("require_labels", [])
+                exclude = meta.get("exclude_labels", [])
                 clear_clause, clear_where, clear_display = _build_label_clause(
                     labels_and, labels_or)
-                
+                clear_match_expr = f"(n:{clear_clause})" if clear_clause else "(n)"
+                # Apply the same require/exclude filters used during export
                 where_parts = list(clear_where)
                 where_parts += [f"n:{_esc(r)}" for r in require]
                 where_parts += [f"NOT n:{_esc(e)}" for e in exclude]
-
-                clear_match_expr = f"(n:{clear_clause})" if clear_clause else "(n)"
                 clear_where_str = (
                     "WHERE " + " AND ".join(where_parts)) if where_parts else ""
-
-                disp_req = f" (require: {require})" if require else ""
-                disp_exc = f" (exclude: {exclude})" if exclude else ""
-                print(f"\nClearing {clear_display}{disp_req}{disp_exc} nodes …")
+                filter_desc = ""
+                if require:
+                    filter_desc += f" (require: {require})"
+                if exclude:
+                    filter_desc += f" (exclude: {exclude})"
+                print(f"\nClearing {clear_display}{filter_desc} nodes …")
                 total = 0
                 while True:
                     result = session.run(
