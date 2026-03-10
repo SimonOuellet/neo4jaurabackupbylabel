@@ -26,11 +26,19 @@ import sys
 import time
 from collections import defaultdict
 from datetime import datetime
+from typing import Any
 
 
 # ── .env loader ──────────────────────────────────────────────────────────
 
-def load_env_file(filepath=".env", override=False):
+def load_env_file(filepath: str = ".env", override: bool = False) -> None:
+    """Load environment variables from a .env file.
+    
+    Args:
+        filepath: Path to the .env file. Defaults to ".env".
+        override: If True, overwrite existing environment variables.
+                  If False, only set variables that are not already present.
+    """
     if not os.path.exists(filepath):
         return
     with open(filepath, "r") as f:
@@ -51,7 +59,16 @@ load_env_file()
 
 # ── Configuration ────────────────────────────────────────────────────────
 
-def _env(name, default=None):
+def _env(name: str, default: str | None = None) -> str | None:
+    """Fetch an environment variable with an optional default.
+    
+    Args:
+        name: The target environment variable name.
+        default: The default value if the environment variable is not defined.
+        
+    Returns:
+        The environment variable value as a string, or the default.
+    """
     return os.getenv(name, default)
 
 
@@ -63,11 +80,19 @@ NEO4J_DATABASE = _env("NEO4J_DATABASE", "neo4j")
 
 # ── Retry session ────────────────────────────────────────────────────────
 
-MAX_RETRIES = 5
-RETRY_DELAY = 5  # seconds
+MAX_RETRIES: int = 5
+RETRY_DELAY: int = 5  # seconds
 
 
-def _is_transient(e):
+def _is_transient(e: Exception) -> bool:
+    """Determine if a Neo4j exception is transient and should be retried.
+    
+    Args:
+        e: The exception raised by the Neo4j driver.
+        
+    Returns:
+        True if the error indicates a temporary failure (like network issues), False otherwise.
+    """
     s = str(e).lower()
     return any(k in s for k in [
         "transient", "replication", "shutting down", "serviceunavailable",
@@ -80,20 +105,37 @@ def _is_transient(e):
 class RetrySession:
     """Neo4j session wrapper with automatic retry on transient errors."""
 
-    def __init__(self, driver, database):
+    def __init__(self, driver: Any, database: str | None) -> None:
+        """Initialize the RetrySession.
+        
+        Args:
+            driver: The Neo4j GraphDatabase driver instance.
+            database: The target Neo4j database name.
+        """
         self.driver = driver
         self.database = database
         self._session = None
 
-    def __enter__(self):
+    def __enter__(self) -> "RetrySession":
+        """Open the session upon entering the context."""
         self._session = self.driver.session(database=self.database)
         return self
 
-    def __exit__(self, *args):
+    def __exit__(self, *args: Any) -> None:
+        """Close the session upon exiting the context."""
         if self._session:
             self._session.close()
 
-    def run(self, query, params=None):
+    def run(self, query: str, params: dict[str, Any] | None = None) -> Any:
+        """Execute a Cypher query with automatic retry logic.
+        
+        Args:
+            query: The Cypher query string to execute.
+            params: Optional parameters dictionary for the query.
+            
+        Returns:
+            The result of the Cypher execution.
+        """
         last = None
         for attempt in range(MAX_RETRIES):
             try:
@@ -118,7 +160,18 @@ class RetrySession:
 
 # ── Connection helpers ───────────────────────────────────────────────────
 
-def _connect(uri, user, password, database):
+def _connect(uri: str, user: str, password: str, database: str | None) -> Any:
+    """Establish and verify a connection to a Neo4j database.
+    
+    Args:
+        uri: The Neo4j database URI.
+        user: The username for authentication.
+        password: The password for authentication.
+        database: The target database name (for logging context).
+        
+    Returns:
+        An authenticated and verified Neo4j driver instance.
+    """
     from neo4j import GraphDatabase
 
     driver = GraphDatabase.driver(uri, auth=(user, password))
@@ -127,8 +180,18 @@ def _connect(uri, user, password, database):
     return driver
 
 
-def _resolve_connection(args, prefix):
-    """Resolve connection: CLI flags > NEO4J_{PREFIX}* env > NEO4J_* env > defaults."""
+def _resolve_connection(args: argparse.Namespace, prefix: str) -> tuple[str | None, str | None, str | None, str | None]:
+    """Resolve connection details falling back through defined sources.
+    
+    Precedence: CLI flags > NEO4J_{PREFIX}* env > NEO4J_* env > defaults.
+    
+    Args:
+        args: The CLI arguments parsed by argparse.
+        prefix: The connection prefix (e.g., 'EXPORT_', 'IMPORT_').
+        
+    Returns:
+        A tuple containing (uri, user, password, database).
+    """
     uri = (getattr(args, "uri", None)
            or _env(f"NEO4J_{prefix}URI") or NEO4J_URI)
     user = (getattr(args, "user", None)
@@ -143,8 +206,15 @@ def _resolve_connection(args, prefix):
 
 # ── Property serialization ──────────────────────────────────────────────
 
-def _serialize(val):
-    """Convert a Neo4j property value to a JSON-safe representation."""
+def _serialize(val: Any) -> Any:
+    """Convert a Neo4j property value to a JSON-safe representation.
+    
+    Args:
+        val: The raw property value straight from Neo4j (e.g., temporal, spatial).
+        
+    Returns:
+        A JSON-serializable version of the property mapping the type structure.
+    """
     if val is None or isinstance(val, (str, int, float, bool)):
         return val
     if isinstance(val, list):
@@ -155,8 +225,15 @@ def _serialize(val):
     return {"__neo4j__": type(val).__name__, "v": str(val)}
 
 
-def _deserialize(val):
-    """Restore a serialized property value for Neo4j."""
+def _deserialize(val: Any) -> Any:
+    """Restore a serialized property value into its original Neo4j target type.
+    
+    Args:
+        val: The serialized mapping extracted from the JSON backup.
+        
+    Returns:
+        The Python object ready to be safely submitted back to Neo4j operations.
+    """
     if val is None or isinstance(val, (str, int, float, bool)):
         return val
     if isinstance(val, list):
@@ -190,18 +267,39 @@ def _deserialize(val):
 
 # ── Cypher helpers ───────────────────────────────────────────────────────
 
-def _esc(name):
-    """Backtick-escape a Cypher identifier."""
+def _esc(name: str) -> str:
+    """Backtick-escape a Cypher identifier safely.
+    
+    Args:
+        name: The raw identifier string (e.g., label or property key).
+        
+    Returns:
+        The safely escaped Cypher identifier.
+    """
     return f"`{name.replace('`', '``')}`"
 
 
-def _labels(lst):
-    """Build a Cypher label chain from a list of label names."""
+def _labels(lst: list[str]) -> str:
+    """Build a Cypher label chain from a list of label names.
+    
+    Args:
+        lst: Collection of label strings.
+        
+    Returns:
+        A unified string for MATCH patterns (e.g., '`Label1`:`Label2`').
+    """
     return ":".join(_esc(l) for l in lst)
 
 
-def _if_not_exists(stmt):
-    """Inject IF NOT EXISTS into a CREATE CONSTRAINT/INDEX statement."""
+def _if_not_exists(stmt: str | None) -> str | None:
+    """Inject IF NOT EXISTS into a CREATE CONSTRAINT/INDEX statement safely.
+    
+    Args:
+        stmt: The original structural CREATE statement.
+        
+    Returns:
+        The adjusted statement formatted dynamically to be idempotent.
+    """
     if not stmt or "IF NOT EXISTS" in stmt:
         return stmt
     return re.sub(
@@ -214,8 +312,16 @@ def _if_not_exists(stmt):
 
 # ── Schema discovery ────────────────────────────────────────────────────
 
-def _discover_schema(session, all_labels):
-    """Return (constraints, indexes) relevant to the given label set."""
+def _discover_schema(session: Any, all_labels: set[str]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Return (constraints, indexes) relevant to the given label set.
+    
+    Args:
+        session: An active Neo4j (retry) session or standard transaction.
+        all_labels: The collective set of all node labels queried.
+        
+    Returns:
+        A tuple of (constraints_list, indexes_list) mapped directly to matching labels.
+    """
     constraints, indexes = [], []
 
     # Constraints
@@ -263,8 +369,15 @@ def _discover_schema(session, all_labels):
     return constraints, indexes
 
 
-def _build_merge_map(constraints):
-    """Map label → list of merge-key property names from uniqueness constraints."""
+def _build_merge_map(constraints: list[dict[str, Any]]) -> dict[str, list[str]]:
+    """Map label -> list of merge-key property names from uniqueness constraints.
+    
+    Args:
+        constraints: The raw constraint dictionary elements.
+        
+    Returns:
+        Mapping from label names to lists of their respective unique keys.
+    """
     m = {}
     for c in constraints:
         if c["type"] in ("UNIQUENESS", "NODE_KEY", "NODE_PROPERTY_UNIQUENESS"):
@@ -274,8 +387,16 @@ def _build_merge_map(constraints):
     return m
 
 
-def _merge_keys_for(node_labels, merge_map):
-    """Return the merge-key property names for a node, based on its labels."""
+def _merge_keys_for(node_labels: list[str], merge_map: dict[str, list[str]]) -> list[str] | None:
+    """Return the merge-key property names for a node, based on its labels.
+    
+    Args:
+        node_labels: Sequential labels applied to a distinct node.
+        merge_map: Constraint mappings mapping label names to their properties.
+        
+    Returns:
+        Mapped merge-keys or None if constraints fail to register exactly.
+    """
     for lbl in node_labels:
         if lbl in merge_map:
             return merge_map[lbl]
@@ -284,13 +405,15 @@ def _merge_keys_for(node_labels, merge_map):
 
 # ── Export ───────────────────────────────────────────────────────────────
 
-def _build_label_clause(labels_and, labels_or):
+def _build_label_clause(labels_and: list[str], labels_or: list[str]) -> tuple[str, list[str], str]:
     """Build (match_clause, where_fragment, display_str) for label selection.
 
-    Returns a tuple:
-      - match_clause : string to put in MATCH (n:<here>)
-      - label_where  : extra WHERE fragment (may be empty)
-      - display      : human-readable description
+    Args:
+        labels_and: Required labels mapped concurrently using basic MATCH expressions.
+        labels_or: Any matching properties structured across OR sequences iteratively.
+        
+    Returns:
+        A tuple mapping to the main MATCH clause strings: (match_clause, parts_where, display).
     """
     parts_where = []
     if labels_and:
@@ -316,7 +439,12 @@ def _build_label_clause(labels_and, labels_or):
     return match_clause, parts_where, display
 
 
-def do_export(args):
+def do_export(args: argparse.Namespace) -> None:
+    """Execute the export process mapping metadata, variables, constraints and relationships.
+    
+    Args:
+        args: Terminally matched argument namespace parsing via python's `argparse`.
+    """
     labels_and = args.label or []
     labels_or = args.label_or or []
     require = args.require_label or []
@@ -456,7 +584,12 @@ def do_export(args):
 
 # ── Import ───────────────────────────────────────────────────────────────
 
-def do_import(args):
+def do_import(args: argparse.Namespace) -> None:
+    """Execute the sequential import process returning data, schema, variables and bindings.
+    
+    Args:
+        args: Terminally matched argument namespace variables initialized from file properties.
+    """
     input_file = args.input
     batch_size = args.batch_size
 
@@ -646,7 +779,8 @@ def do_import(args):
 
 # ── CLI ──────────────────────────────────────────────────────────────────
 
-def _add_connection_args(parser):
+def _add_connection_args(parser: argparse.ArgumentParser) -> None:
+    """Register uniform database connection arguments to an executable argument namespace."""
     g = parser.add_argument_group("Neo4j Connection (overrides .env)")
     g.add_argument("--uri", help="Neo4j URI")
     g.add_argument("--user", help="Neo4j user")
@@ -654,7 +788,8 @@ def _add_connection_args(parser):
     g.add_argument("--database", help="Neo4j database name")
 
 
-def build_parser():
+def build_parser() -> argparse.ArgumentParser:
+    """Build and configure the command-line argument parser for terminal use."""
     parser = argparse.ArgumentParser(
         description="Neo4j label-level backup & restore.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -716,7 +851,8 @@ Examples:
     return parser
 
 
-def main():
+def main() -> None:
+    """Primary execution trigger mapping CLI calls to application logic branches."""
     args = build_parser().parse_args()
     if args.command == "export":
         do_export(args)
