@@ -28,9 +28,9 @@ from collections import defaultdict
 from datetime import datetime
 
 
-# ── .env loader (same pattern as jira_etl.py) ───────────────────────────
+# ── .env loader ──────────────────────────────────────────────────────────
 
-def load_env_file(filepath=".env"):
+def load_env_file(filepath=".env", override=False):
     if not os.path.exists(filepath):
         return
     with open(filepath, "r") as f:
@@ -40,7 +40,10 @@ def load_env_file(filepath=".env"):
                 continue
             if "=" in line:
                 key, value = line.split("=", 1)
-                os.environ[key.strip()] = value.strip()
+                key = key.strip()
+                value = value.strip()
+                if override or key not in os.environ:
+                    os.environ[key] = value
 
 
 load_env_file()
@@ -168,6 +171,15 @@ def _deserialize(val):
                 cls = getattr(nt, t, None)
                 if cls and hasattr(cls, "from_iso_format"):
                     return cls.from_iso_format(v)
+            except Exception:
+                pass
+            try:
+                import neo4j.spatial as ns
+                if t in ("CartesianPoint", "WGS84Point"):
+                    m = re.match(r"^\w+\((.*)\)$", v)
+                    if m:
+                        coords = [float(x.strip()) for x in m.group(1).split(",")]
+                        return getattr(ns, t)(coords)
             except Exception:
                 pass
             return v  # fallback → string
@@ -337,10 +349,10 @@ def do_export(args):
                   + (f" (require: {require})" if require else "")
                   + (f" (exclude: {exclude})" if exclude else ""))
 
-            records = list(session.run(
+            records = session.run(
                 f"MATCH {match_expr} {where} "
                 f"RETURN elementId(n) AS eid, labels(n) AS labels, properties(n) AS props"
-            ))
+            )
 
             nodes = []
             eid_to_idx = {}
@@ -382,26 +394,29 @@ def do_export(args):
             # ── 4. Internal relationships ────────────────────────────
             print("Exporting internal relationships …")
             rels = []
-            eid_set = set(eid_to_idx.keys())
-            # Use the exported elementIds to find internal rels
-            for rec in session.run(
-                "UNWIND $eids AS eid "
-                "MATCH (a)-[r]->(b) "
-                "WHERE elementId(a) = eid "
-                "RETURN elementId(a) AS a_eid, elementId(b) AS b_eid, "
-                "       type(r) AS rtype, properties(r) AS rprops",
-                {"eids": list(eid_set)},
-            ):
-                a_idx = eid_to_idx.get(rec["a_eid"])
-                b_idx = eid_to_idx.get(rec["b_eid"])
-                if a_idx is not None and b_idx is not None:
-                    rprops = {k: _serialize(v) for k, v in rec["rprops"].items()}
-                    rels.append({
-                        "type": rec["rtype"],
-                        "start_node": a_idx,
-                        "end_node": b_idx,
-                        "properties": rprops,
-                    })
+            eid_list = list(eid_to_idx.keys())
+            # Use the exported elementIds to find internal rels (batching to avoid parameter limits)
+            rel_batch_size = 10000
+            for i in range(0, len(eid_list), rel_batch_size):
+                batch_eids = eid_list[i:i + rel_batch_size]
+                for rec in session.run(
+                    "UNWIND $eids AS eid "
+                    "MATCH (a)-[r]->(b) "
+                    "WHERE elementId(a) = eid "
+                    "RETURN elementId(a) AS a_eid, elementId(b) AS b_eid, "
+                    "       type(r) AS rtype, properties(r) AS rprops",
+                    {"eids": batch_eids},
+                ):
+                    a_idx = eid_to_idx.get(rec["a_eid"])
+                    b_idx = eid_to_idx.get(rec["b_eid"])
+                    if a_idx is not None and b_idx is not None:
+                        rprops = {k: _serialize(v) for k, v in rec["rprops"].items()}
+                        rels.append({
+                            "type": rec["rtype"],
+                            "start_node": a_idx,
+                            "end_node": b_idx,
+                            "properties": rprops,
+                        })
 
             print(f"  {len(rels)} relationships")
 
