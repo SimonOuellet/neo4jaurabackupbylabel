@@ -468,8 +468,6 @@ def do_import(args):
     # Support old format ("label": str), "labels" (AND list), "labels_or" (OR list)
     labels_and = meta.get("labels") or ([meta["label"]] if "label" in meta else [])
     labels_or = meta.get("labels_or", [])
-    require = meta.get("require_labels", [])
-    exclude = meta.get("exclude_labels", [])
     nodes = data["nodes"]
     rels = data["relationships"]
     constraints_data = data.get("constraints", [])
@@ -490,20 +488,23 @@ def do_import(args):
         with RetrySession(driver, db) as session:
             # ── Clear ────────────────────────────────────────────────
             if args.clear:
+                require = meta.get("require_labels", [])
+                exclude = meta.get("exclude_labels", [])
                 clear_clause, clear_where, clear_display = _build_label_clause(
                     labels_and, labels_or)
-                
+                clear_match_expr = f"(n:{clear_clause})" if clear_clause else "(n)"
+                # Apply the same require/exclude filters used during export
                 where_parts = list(clear_where)
                 where_parts += [f"n:{_esc(r)}" for r in require]
                 where_parts += [f"NOT n:{_esc(e)}" for e in exclude]
-
-                clear_match_expr = f"(n:{clear_clause})" if clear_clause else "(n)"
                 clear_where_str = (
                     "WHERE " + " AND ".join(where_parts)) if where_parts else ""
-
-                disp_req = f" (require: {require})" if require else ""
-                disp_exc = f" (exclude: {exclude})" if exclude else ""
-                print(f"\nClearing {clear_display}{disp_req}{disp_exc} nodes …")
+                filter_desc = ""
+                if require:
+                    filter_desc += f" (require: {require})"
+                if exclude:
+                    filter_desc += f" (exclude: {exclude})"
+                print(f"\nClearing {clear_display}{filter_desc} nodes …")
                 total = 0
                 while True:
                     result = session.run(
